@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+#
+# enclawd — launch Claude Code against Engram Robotics' AWS Bedrock account with
+# the company plugin marketplace (skills + MCP servers) enabled.
+#
+# Uses CLAUDE_CONFIG_DIR to keep a separate profile in ~/.enclawd, so a plain
+# `claude` keeps whatever personal setup you already have.
+#
+# Environment overrides:
+#   ENCLAWD_CONFIG_DIR       config dir to use (default: ~/.enclawd)
+#   ENCLAWD_MARKETPLACE_DIR  use a local clone of claude-plugins instead of
+#                            GitHub (for testing the marketplace before pushing)
+#   ENCLAWD_SKIP_AWS_CHECK   set to 1 to skip the AWS credential preflight
+
+set -euo pipefail
+
+# --- Resolve the repo directory through the ~/.local/bin symlink -------------
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ $src != /* ]] && src="$dir/$src"
+done
+REPO_DIR="$(cd -P "$(dirname "$src")/.." && pwd)"
+
+TEMPLATE="$REPO_DIR/settings.template.json"
+CONFIG_DIR="${ENCLAWD_CONFIG_DIR:-$HOME/.enclawd}"
+SETTINGS="$CONFIG_DIR/settings.json"
+
+if [ ! -f "$TEMPLATE" ]; then
+  echo "enclawd: settings.template.json not found next to $REPO_DIR/bin/enclawd." >&2
+  echo "enclawd: keep the enclawd repo clone around — the command is a symlink into it." >&2
+  exit 1
+fi
+
+read -r AWS_PROFILE_NAME AWS_REGION_NAME MARKETPLACE_NAME < <(python3 - "$TEMPLATE" <<'PY'
+import json, sys
+t = json.load(open(sys.argv[1]))
+mp = next(iter(t.get("extraKnownMarketplaces", {"engram-tools": None})))
+print(t["env"]["AWS_PROFILE"], t["env"]["AWS_REGION"], mp)
+PY
+)
+
+# --- Preflight: AWS profile exists and credentials are live ------------------
+mkdir -p "$HOME/.aws"
+touch "$HOME/.aws/config"
+if ! grep -q "^\[profile $AWS_PROFILE_NAME\]" "$HOME/.aws/config"; then
+  printf '\n[profile %s]\nregion = %s\n' "$AWS_PROFILE_NAME" "$AWS_REGION_NAME" >> "$HOME/.aws/config"
+  echo "enclawd: added [profile $AWS_PROFILE_NAME] to ~/.aws/config"
+fi
+
+if [ "${ENCLAWD_SKIP_AWS_CHECK:-0}" != "1" ] && [ "${1:-}" != "doctor" ]; then
+  if ! aws sts get-caller-identity --profile "$AWS_PROFILE_NAME" --region "$AWS_REGION_NAME" >/dev/null 2>&1; then
+    echo "enclawd: AWS credentials for profile '$AWS_PROFILE_NAME' are missing or expired." >&2
+    echo "enclawd: run:  aws login --profile $AWS_PROFILE_NAME   and then re-run enclawd." >&2
+    exit 1
+  fi
+fi
+
+# --- Sync managed settings into $CONFIG_DIR/settings.json --------------------
+# Deep-merges the repo template over the existing file: managed keys always win
+# (so a git pull of this repo updates everyone), unmanaged keys the user or
+# Claude Code wrote are preserved. With ENCLAWD_MARKETPLACE_DIR set, the GitHub
+# marketplace entry is dropped and the local clone is registered instead below.
+mkdir -p "$CONFIG_DIR"
+python3 - "$TEMPLATE" "$SETTINGS" <<'PY'
+import json, os, sys
+
+template_path, settings_path = sys.argv[1], sys.argv[2]
+tpl = json.load(open(template_path))
+if os.environ.get("ENCLAWD_MARKETPLACE_DIR"):
+    tpl.pop("extraKnownMarketplaces", None)
+
+cur = {}
+if os.path.exists(settings_path):
+    try:
+        cur = json.load(open(settings_path))
+    except (ValueError, OSError):
+        os.replace(settings_path, settings_path + ".bak")
+        print(f"enclawd: {settings_path} was unreadable; moved aside to settings.json.bak")
+
+def merge(dst, src):
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            merge(dst[k], v)
+        else:
+            dst[k] = v
+
+merged = dict(cur)
+merge(merged, tpl)
+if merged != cur:
+    with open(settings_path, "w") as f:
+        json.dump(merged, f, indent=2)
+        f.write("\n")
+PY
+
+export CLAUDE_CONFIG_DIR="$CONFIG_DIR"
+
+# --- Local marketplace override (testing before the repos are pushed) --------
+if [ -n "${ENCLAWD_MARKETPLACE_DIR:-}" ]; then
+  if ! claude plugin marketplace list 2>/dev/null | grep -q "$MARKETPLACE_NAME"; then
+    claude plugin marketplace add "$ENCLAWD_MARKETPLACE_DIR"
+    claude plugin install "company-core@$MARKETPLACE_NAME" --yes
+  fi
+fi
+
+# --- doctor: verify the whole chain without starting a session ---------------
+if [ "${1:-}" = "doctor" ]; then
+  echo "== enclawd doctor =="
+  echo "repo:       $REPO_DIR"
+  echo "config dir: $CONFIG_DIR"
+  echo
+  echo "-- AWS identity ($AWS_PROFILE_NAME @ $AWS_REGION_NAME) --"
+  aws sts get-caller-identity --profile "$AWS_PROFILE_NAME" --region "$AWS_REGION_NAME" || {
+    echo "FAILED — run: aws login --profile $AWS_PROFILE_NAME"; exit 1; }
+  echo
+  echo "-- Claude inference profiles enabled in Bedrock --"
+  aws bedrock list-inference-profiles --profile "$AWS_PROFILE_NAME" --region "$AWS_REGION_NAME" \
+    --query 'inferenceProfileSummaries[].inferenceProfileId' --output text | tr '\t' '\n' | grep -i claude || {
+    echo "FAILED — Bedrock access is missing (IAM policy or model access)."; exit 1; }
+  echo
+  echo "-- Model pins in settings.template.json --"
+  python3 -c 'import json,sys; [print(f"{k} = {v}") for k,v in json.load(open(sys.argv[1]))["env"].items() if "MODEL" in k]' "$TEMPLATE"
+  echo
+  echo "Every pinned ID above must appear in the Bedrock list. If not, fix"
+  echo "settings.template.json in the enclawd repo."
+  echo
+  echo "-- Marketplaces / MCP servers --"
+  claude plugin marketplace list || true
+  claude mcp list || true
+  echo
+  echo "-- Round-trip smoke test --"
+  claude -p "Reply with exactly: SETUP OK"
+  exit 0
+fi
+
+# --- Launch ------------------------------------------------------------------
+exec claude "$@"

@@ -49,12 +49,12 @@ esac
 
 cat <<'EOF'
 
-Done. What's left (one-time, can't be automated):
+Done. What's left (one-time):
 
-  1. aws login --profile engram-robotics     # browser sign-in to AWS
-  2. enclawd doctor                          # verifies AWS -> Bedrock -> Claude end to end
-  3. enclawd                                 # company Claude; plain `claude` stays personal
-  4. Inside enclawd, run /mcp and authenticate: linear, notion, figma
+  1. enclawd doctor    # opens a browser to sign in to AWS if needed, then
+                       # verifies AWS -> Bedrock -> Claude end to end
+  2. enclawd           # company Claude; plain `claude` stays personal
+  3. Inside enclawd, run /mcp and authenticate: linear, notion, figma
      (OAuth is per-person by design — once per server.)
 
 Notes: the first run in any repo asks for folder trust once. WebSearch and

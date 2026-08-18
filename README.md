@@ -20,8 +20,9 @@ Then:
 
 ## One-time steps setup can't do for you
 
-1. `aws login --profile engram-robotics` — browser sign-in to AWS. Credentials
-   expire; when they do, enclawd tells you to run this again.
+1. AWS sign-in: when credentials are missing or expired, `enclawd` runs
+   `aws login --profile engram-robotics` for you — you just approve in the
+   browser. (Non-interactive runs fail with that command instead of hanging.)
 2. Inside `enclawd`, run `/mcp` and authenticate **linear, notion, figma**. OAuth is per-person and browser-based — once per server.
 3. The first time you use Claude in a given repo it asks for folder trust. Once
    per folder.

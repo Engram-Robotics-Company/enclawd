@@ -49,11 +49,22 @@ if ! grep -q "^\[profile $AWS_PROFILE_NAME\]" "$HOME/.aws/config"; then
   echo "enclawd: added [profile $AWS_PROFILE_NAME] to ~/.aws/config"
 fi
 
-if [ "${ENCLAWD_SKIP_AWS_CHECK:-0}" != "1" ] && [ "${1:-}" != "doctor" ]; then
+if [ "${ENCLAWD_SKIP_AWS_CHECK:-0}" != "1" ]; then
   if ! aws sts get-caller-identity --profile "$AWS_PROFILE_NAME" --region "$AWS_REGION_NAME" >/dev/null 2>&1; then
-    echo "enclawd: AWS credentials for profile '$AWS_PROFILE_NAME' are missing or expired." >&2
-    echo "enclawd: run:  aws login --profile $AWS_PROFILE_NAME   and then re-run enclawd." >&2
-    exit 1
+    if [ -t 0 ] && [ -t 1 ]; then
+      echo "enclawd: AWS credentials for profile '$AWS_PROFILE_NAME' are missing or expired — opening browser sign-in..."
+      aws login --profile "$AWS_PROFILE_NAME" || true
+      if ! aws sts get-caller-identity --profile "$AWS_PROFILE_NAME" --region "$AWS_REGION_NAME" >/dev/null 2>&1; then
+        echo "enclawd: sign-in didn't complete; run  aws login --profile $AWS_PROFILE_NAME  and re-run enclawd." >&2
+        exit 1
+      fi
+    else
+      # Non-interactive (scripts, CI, `enclawd -p` from another tool): a browser
+      # flow would hang, so fail with the fix instead.
+      echo "enclawd: AWS credentials for profile '$AWS_PROFILE_NAME' are missing or expired." >&2
+      echo "enclawd: run:  aws login --profile $AWS_PROFILE_NAME   and then re-run enclawd." >&2
+      exit 1
+    fi
   fi
 fi
 

@@ -75,7 +75,7 @@ fi
 # marketplace entry is dropped and the local clone is registered instead below.
 mkdir -p "$CONFIG_DIR"
 python3 - "$TEMPLATE" "$SETTINGS" <<'PY'
-import json, os, sys
+import copy, json, os, sys
 
 template_path, settings_path = sys.argv[1], sys.argv[2]
 tpl = json.load(open(template_path))
@@ -97,7 +97,9 @@ def merge(dst, src):
         else:
             dst[k] = v
 
-merged = dict(cur)
+# deepcopy matters: a shallow copy aliases nested dicts, so the in-place merge
+# would mutate `cur` too and the changed-check below would never fire.
+merged = copy.deepcopy(cur)
 merge(merged, tpl)
 if merged != cur:
     with open(settings_path, "w") as f:

@@ -1,0 +1,10 @@
+{
+  "_comment": "AWS IAM Identity Center (SSO) settings for enclawd. These identify Engram's Identity Center instance and the role employees assume. Managed by setup-identity-center.sh in the management-scripts repo.",
+
+  "ssoSessionName": "engram",
+  "ssoStartUrl": "https://d-9a675d7649.awsapps.com/start",
+  "ssoRegion": "us-east-2",
+
+  "accountId": "192573502066",
+  "roleName": "EngramEmployee"
+}

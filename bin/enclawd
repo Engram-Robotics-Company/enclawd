@@ -6,6 +6,10 @@
 # Uses CLAUDE_CONFIG_DIR to keep a separate profile in ~/.enclawd, so a plain
 # `claude` keeps whatever personal setup you already have.
 #
+# Authentication is AWS IAM Identity Center federated to Google Workspace:
+# `aws sso login` opens the access portal, which redirects to the Google sign-in
+# the employee already uses. No IAM user, no access keys, no passwords.
+#
 # Environment overrides:
 #   ENCLAWD_CONFIG_DIR       config dir to use (default: ~/.enclawd)
 #   ENCLAWD_MARKETPLACE_DIR  use a local clone of claude-plugins instead of
@@ -13,6 +17,8 @@
 #   ENCLAWD_SKIP_AWS_CHECK   set to 1 to skip the AWS credential preflight
 
 set -euo pipefail
+
+die() { echo "enclawd: $*" >&2; exit 1; }
 
 # --- Resolve the repo directory through the ~/.local/bin symlink -------------
 src="${BASH_SOURCE[0]}"
@@ -24,46 +30,169 @@ done
 REPO_DIR="$(cd -P "$(dirname "$src")/.." && pwd)"
 
 TEMPLATE="$REPO_DIR/settings.template.json"
+AWSCONF="$REPO_DIR/enclawd.config.json"
 CONFIG_DIR="${ENCLAWD_CONFIG_DIR:-$HOME/.enclawd}"
 SETTINGS="$CONFIG_DIR/settings.json"
 
-if [ ! -f "$TEMPLATE" ]; then
-  echo "enclawd: settings.template.json not found next to $REPO_DIR/bin/enclawd." >&2
-  echo "enclawd: keep the enclawd repo clone around — the command is a symlink into it." >&2
-  exit 1
-fi
+MODE="run"
+[ "${1:-}" = "doctor" ] && MODE="doctor"
 
-read -r AWS_PROFILE_NAME AWS_REGION_NAME MARKETPLACE_NAME < <(python3 - "$TEMPLATE" <<'PY'
+# --- Dependency checks -------------------------------------------------------
+command -v python3 >/dev/null 2>&1 || die "python3 is required but not on PATH."
+command -v claude  >/dev/null 2>&1 || die "the 'claude' CLI is not on PATH. Install Claude Code first."
+command -v aws     >/dev/null 2>&1 || die "the AWS CLI is not on PATH. Install AWS CLI v2: https://aws.amazon.com/cli/"
+aws --version 2>&1 | grep -q '^aws-cli/2' \
+  || die "AWS CLI v2 is required (found: $(aws --version 2>&1)). 'aws sso login' does not exist in v1."
+
+[ -f "$TEMPLATE" ] || die "settings.template.json not found in $REPO_DIR — keep the enclawd repo clone around; the command is a symlink into it."
+[ -f "$AWSCONF" ]  || die "enclawd.config.json not found in $REPO_DIR — git pull the enclawd repo."
+
+# --- Load config (tab-separated so values with spaces survive) ---------------
+IFS=$'\t' read -r AWS_PROFILE_NAME AWS_REGION_NAME MARKETPLACE_NAME MARKETPLACE_REPO \
+                  SSO_SESSION SSO_START_URL SSO_REGION SSO_ACCOUNT_ID SSO_ROLE_NAME \
+  < <(python3 - "$TEMPLATE" "$AWSCONF" <<'PY'
 import json, sys
-t = json.load(open(sys.argv[1]))
-mp = next(iter(t.get("extraKnownMarketplaces", {"engram-tools": None})))
-print(t["env"]["AWS_PROFILE"], t["env"]["AWS_REGION"], mp)
+tpl  = json.load(open(sys.argv[1]))
+conf = json.load(open(sys.argv[2]))
+env  = tpl.get("env", {})
+mps  = tpl.get("extraKnownMarketplaces", {"engram-tools": None})
+mp   = next(iter(mps))
+# "-" sentinel rather than empty: consecutive tabs collapse under IFS=tab read.
+repo = ((mps.get(mp) or {}).get("source") or {}).get("repo") or "-"
+missing = [k for k in ("ssoSessionName", "ssoStartUrl", "ssoRegion", "accountId", "roleName")
+           if not conf.get(k)]
+if missing:
+    sys.exit("enclawd.config.json is missing: " + ", ".join(missing))
+print("\t".join([
+    env.get("AWS_PROFILE", "engram-robotics"),
+    env.get("AWS_REGION", conf["ssoRegion"]),
+    mp, repo,
+    conf["ssoSessionName"], conf["ssoStartUrl"], conf["ssoRegion"],
+    str(conf["accountId"]), conf["roleName"],
+]))
 PY
-)
+) || die "could not read settings.template.json / enclawd.config.json (see error above)."
 
-# --- Preflight: AWS profile exists and credentials are live ------------------
+# --- Ensure ~/.aws/config has a complete SSO session + profile ---------------
+# Surgical: appends only missing sections/keys, never rewrites or reorders the
+# rest of the file, and warns (rather than clobbers) if a value was deliberately
+# changed. One exception: a leftover `login_session` key (from the old
+# `aws login` flow) is removed from our profile — it conflicts with SSO.
 mkdir -p "$HOME/.aws"
-touch "$HOME/.aws/config"
-if ! grep -q "^\[profile $AWS_PROFILE_NAME\]" "$HOME/.aws/config"; then
-  printf '\n[profile %s]\nregion = %s\n' "$AWS_PROFILE_NAME" "$AWS_REGION_NAME" >> "$HOME/.aws/config"
-  echo "enclawd: added [profile $AWS_PROFILE_NAME] to ~/.aws/config"
-fi
+python3 - "$SSO_SESSION" "$SSO_START_URL" "$SSO_REGION" \
+           "$AWS_PROFILE_NAME" "$SSO_ACCOUNT_ID" "$SSO_ROLE_NAME" "$AWS_REGION_NAME" <<'PY'
+import os, re, sys
 
-if [ "${ENCLAWD_SKIP_AWS_CHECK:-0}" != "1" ]; then
-  if ! aws sts get-caller-identity --profile "$AWS_PROFILE_NAME" --region "$AWS_REGION_NAME" >/dev/null 2>&1; then
-    if [ -t 0 ] && [ -t 1 ]; then
-      echo "enclawd: AWS credentials for profile '$AWS_PROFILE_NAME' are missing or expired — opening browser sign-in..."
-      aws login --profile "$AWS_PROFILE_NAME" || true
-      if ! aws sts get-caller-identity --profile "$AWS_PROFILE_NAME" --region "$AWS_REGION_NAME" >/dev/null 2>&1; then
-        echo "enclawd: sign-in didn't complete; run  aws login --profile $AWS_PROFILE_NAME  and re-run enclawd." >&2
-        exit 1
-      fi
+session, start_url, sso_region, profile, account_id, role_name, region = sys.argv[1:8]
+path = os.path.expanduser("~/.aws/config")
+text = open(path).read() if os.path.exists(path) else ""
+lines = text.splitlines()
+changed = []
+
+def bounds(name):
+    start = None
+    for i, l in enumerate(lines):
+        if l.strip() == "[%s]" % name:
+            start = i
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].lstrip().startswith("["):
+            end = j
+            break
+    return start, end
+
+def ensure(name, kv, remove=()):
+    global lines
+    b = bounds(name)
+    if b is None:
+        block = []
+        if lines and lines[-1].strip():
+            block.append("")
+        block.append("[%s]" % name)
+        block += ["%s = %s" % (k, v) for k, v in kv.items()]
+        lines += block
+        changed.append("added [%s]" % name)
+        return
+    s, e = b
+    for k in remove:
+        for j in range(e - 1, s, -1):
+            if re.match(r"\s*%s\s*=" % re.escape(k), lines[j]):
+                del lines[j]
+                changed.append("removed legacy %s from [%s]" % (k, name))
+    s, e = bounds(name)
+    have = {}
+    for l in lines[s + 1:e]:
+        m = re.match(r"\s*([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$", l)
+        if m:
+            have[m.group(1)] = m.group(2)
+    missing = {k: v for k, v in kv.items() if k not in have}
+    for k, v in kv.items():
+        if k in have and have[k] != v:
+            sys.stderr.write(
+                "enclawd: warning: ~/.aws/config [%s] %s is '%s' but enclawd expects '%s' "
+                "— leaving your value alone.\n" % (name, k, have[k], v))
+    if missing:
+        lines[s + 1:s + 1] = ["%s = %s" % (k, v) for k, v in missing.items()]
+        changed.append("added %s to [%s]" % (", ".join(missing), name))
+
+ensure("sso-session %s" % session, {
+    "sso_start_url": start_url,
+    "sso_region": sso_region,
+    "sso_registration_scopes": "sso:account:access",
+})
+ensure("profile %s" % profile, {
+    "sso_session": session,
+    "sso_account_id": account_id,
+    "sso_role_name": role_name,
+    "region": region,
+    "output": "json",
+}, remove=("login_session",))
+
+if changed:
+    with open(path, "w") as f:
+        f.write("\n".join(lines).rstrip("\n") + "\n")
+    print("enclawd: ~/.aws/config — " + "; ".join(changed))
+PY
+
+# --- Preflight: are Identity Center credentials live? ------------------------
+creds_ok() {
+  aws sts get-caller-identity --profile "$AWS_PROFILE_NAME" --region "$AWS_REGION_NAME" >/dev/null 2>&1
+}
+
+sso_login() {
+  # Opens the IAM Identity Center access portal in the browser. The portal is
+  # federated to Google Workspace, so this lands on the normal Google sign-in.
+  #
+  # If the browser flow fails, fall back to the device-code flow. The usual
+  # failure is AWS's "We couldn't verify your sign-in credentials" page, which
+  # happens when the flow straddles two browser profiles (the sign-in state
+  # lives in the profile that opened, the Google session in another — common
+  # with Arc/Chrome multi-profile setups). Device code sidesteps it: paste the
+  # printed URL into the profile where your Engram Google account lives and
+  # the whole flow stays in one place.
+  aws sso login --sso-session "$SSO_SESSION" || true
+  creds_ok && return 0
+  echo "enclawd: browser sign-in didn't stick. This usually means it hopped between browser"
+  echo "enclawd: profiles mid-flow. Trying the device-code flow instead — open the URL below"
+  echo "enclawd: in the browser profile where your Engram Google account is signed in."
+  aws sso login --sso-session "$SSO_SESSION" --use-device-code || true
+  creds_ok
+}
+
+if [ "$MODE" != "doctor" ] && [ "${ENCLAWD_SKIP_AWS_CHECK:-0}" != "1" ]; then
+  if ! creds_ok; then
+    if [ -t 1 ]; then
+      echo "enclawd: AWS session for '$AWS_PROFILE_NAME' is missing or expired — opening browser sign-in (use your Engram Google account)..."
+      sso_login \
+        || die "sign-in didn't complete. Run:  aws sso login --sso-session $SSO_SESSION   then re-run enclawd."
     else
       # Non-interactive (scripts, CI, `enclawd -p` from another tool): a browser
       # flow would hang, so fail with the fix instead.
-      echo "enclawd: AWS credentials for profile '$AWS_PROFILE_NAME' are missing or expired." >&2
-      echo "enclawd: run:  aws login --profile $AWS_PROFILE_NAME   and then re-run enclawd." >&2
-      exit 1
+      echo "enclawd: AWS session for '$AWS_PROFILE_NAME' is missing or expired." >&2
+      die "run:  aws sso login --sso-session $SSO_SESSION   then re-run enclawd."
     fi
   fi
 fi
@@ -74,13 +203,19 @@ fi
 # Claude Code wrote are preserved. With ENCLAWD_MARKETPLACE_DIR set, the GitHub
 # marketplace entry is dropped and the local clone is registered instead below.
 mkdir -p "$CONFIG_DIR"
-python3 - "$TEMPLATE" "$SETTINGS" <<'PY'
+python3 - "$TEMPLATE" "$SETTINGS" "$SSO_SESSION" <<'PY'
 import copy, json, os, sys
 
-template_path, settings_path = sys.argv[1], sys.argv[2]
+template_path, settings_path, session = sys.argv[1], sys.argv[2], sys.argv[3]
 tpl = json.load(open(template_path))
 if os.environ.get("ENCLAWD_MARKETPLACE_DIR"):
     tpl.pop("extraKnownMarketplaces", None)
+
+# Re-auth in place when the SSO token expires mid-session instead of dying
+# halfway through a task. Claude Code runs this only on credential expiry.
+# Set here (not in the template) so the session name can't drift from
+# enclawd.config.json.
+tpl["awsAuthRefresh"] = "aws sso login --sso-session %s" % session
 
 cur = {}
 if os.path.exists(settings_path):
@@ -88,7 +223,7 @@ if os.path.exists(settings_path):
         cur = json.load(open(settings_path))
     except (ValueError, OSError):
         os.replace(settings_path, settings_path + ".bak")
-        print(f"enclawd: {settings_path} was unreadable; moved aside to settings.json.bak")
+        print("enclawd: %s was unreadable; moved aside to settings.json.bak" % settings_path)
 
 def merge(dst, src):
     for k, v in src.items():
@@ -109,39 +244,103 @@ PY
 
 export CLAUDE_CONFIG_DIR="$CONFIG_DIR"
 
-# --- Local marketplace override (testing before the repos are pushed) --------
-if [ -n "${ENCLAWD_MARKETPLACE_DIR:-}" ]; then
-  if ! claude plugin marketplace list 2>/dev/null | grep -q "$MARKETPLACE_NAME"; then
+# --- AWS MCP server (managed remote, OAuth) ----------------------------------
+# https://docs.aws.amazon.com/agent-toolkit/latest/userguide/getting-started-aws-mcp-server.html
+# OAuth rather than the SigV4 proxy: no uvx dependency, and the EngramEmployee
+# permission set already carries AWSMCPSignInOAuthAccessPolicy. First use asks
+# for a one-time browser sign-in (run /mcp inside Claude Code); tokens refresh
+# for up to 12h. us-east-1 is the closest of the two endpoints AWS offers —
+# it's just where the MCP service runs, unrelated to our us-east-2 resources.
+AWS_MCP_URL="https://aws-mcp.us-east-1.api.aws/mcp"
+if ! claude mcp get aws-mcp >/dev/null 2>&1; then
+  echo "enclawd: registering AWS MCP server ..."
+  claude mcp add --scope user --transport http aws-mcp "$AWS_MCP_URL" \
+    || echo "enclawd: warning: could not register AWS MCP server" >&2
+fi
+
+# --- Marketplace registration ------------------------------------------------
+# extraKnownMarketplaces in settings.json is not enough on a fresh profile:
+# `claude plugin install` can't see the marketplace until it has been cloned,
+# so register it explicitly. ENCLAWD_MARKETPLACE_DIR (local clone, for testing
+# before pushing) takes priority over the GitHub source from the template.
+if ! claude plugin marketplace list 2>/dev/null | grep -q "$MARKETPLACE_NAME"; then
+  if [ -n "${ENCLAWD_MARKETPLACE_DIR:-}" ]; then
     claude plugin marketplace add "$ENCLAWD_MARKETPLACE_DIR"
-    claude plugin install "company-core@$MARKETPLACE_NAME" --yes
+  elif [ "$MARKETPLACE_REPO" != "-" ]; then
+    echo "enclawd: registering plugin marketplace $MARKETPLACE_NAME ($MARKETPLACE_REPO) ..."
+    claude plugin marketplace add "$MARKETPLACE_REPO" \
+      || echo "enclawd: warning: could not add marketplace $MARKETPLACE_NAME — company plugins will be unavailable" >&2
   fi
 fi
 
+# --- Make sure everything in enabledPlugins is actually installed ------------
+# settings.json registers the marketplace but does not install plugins; a first
+# run still needs the install, and --yes keeps it from blocking on a prompt.
+installed="$(claude plugin list 2>/dev/null || true)"
+while IFS= read -r plugin; do
+  [ -z "$plugin" ] && continue
+  case "$installed" in
+    *"${plugin%%@*}"*) continue ;;
+  esac
+  echo "enclawd: installing plugin $plugin ..."
+  claude plugin install "$plugin" --yes || echo "enclawd: warning: could not install $plugin" >&2
+done < <(python3 -c '
+import json, os, sys
+p = sys.argv[1]
+d = json.load(open(p)) if os.path.exists(p) else {}
+mp = sys.argv[2]
+for k, v in (d.get("enabledPlugins") or {}).items():
+    if v and (not os.environ.get("ENCLAWD_MARKETPLACE_DIR") or k.endswith("@" + mp)):
+        print(k)
+' "$SETTINGS" "$MARKETPLACE_NAME")
+
 # --- doctor: verify the whole chain without starting a session ---------------
-if [ "${1:-}" = "doctor" ]; then
+if [ "$MODE" = "doctor" ]; then
   echo "== enclawd doctor =="
-  echo "repo:       $REPO_DIR"
-  echo "config dir: $CONFIG_DIR"
+  echo "repo:        $REPO_DIR"
+  echo "config dir:  $CONFIG_DIR"
+  echo "sso session: $SSO_SESSION  ($SSO_START_URL)"
+  echo "profile:     $AWS_PROFILE_NAME -> account $SSO_ACCOUNT_ID, role $SSO_ROLE_NAME @ $AWS_REGION_NAME"
   echo
-  echo "-- AWS identity ($AWS_PROFILE_NAME @ $AWS_REGION_NAME) --"
+
+  echo "-- Bedrock enabled in settings.template.json --"
+  python3 -c '
+import json, sys
+env = json.load(open(sys.argv[1])).get("env", {})
+if str(env.get("CLAUDE_CODE_USE_BEDROCK")) not in ("1", "true"):
+    sys.exit("FAILED - env.CLAUDE_CODE_USE_BEDROCK is not \"1\"; Claude Code would talk to the Anthropic API, not Bedrock.")
+print("OK - CLAUDE_CODE_USE_BEDROCK=1")
+' "$TEMPLATE"
+  echo
+
+  echo "-- AWS identity --"
+  if ! creds_ok; then
+    echo "no live session; opening browser sign-in (use your Engram Google account)..."
+    sso_login || true
+  fi
   aws sts get-caller-identity --profile "$AWS_PROFILE_NAME" --region "$AWS_REGION_NAME" || {
-    echo "FAILED — run: aws login --profile $AWS_PROFILE_NAME"; exit 1; }
+    echo "FAILED — run: aws sso login --sso-session $SSO_SESSION"; exit 1; }
   echo
+
   echo "-- Claude inference profiles enabled in Bedrock --"
   aws bedrock list-inference-profiles --profile "$AWS_PROFILE_NAME" --region "$AWS_REGION_NAME" \
     --query 'inferenceProfileSummaries[].inferenceProfileId' --output text | tr '\t' '\n' | grep -i claude || {
-    echo "FAILED — Bedrock access is missing (IAM policy or model access)."; exit 1; }
+    echo "FAILED — Bedrock access is missing (permission set policy or model access)."; exit 1; }
   echo
+
   echo "-- Model pins in settings.template.json --"
   python3 -c 'import json,sys; [print(f"{k} = {v}") for k,v in json.load(open(sys.argv[1]))["env"].items() if "MODEL" in k]' "$TEMPLATE"
   echo
   echo "Every pinned ID above must appear in the Bedrock list. If not, fix"
   echo "settings.template.json in the enclawd repo."
   echo
-  echo "-- Marketplaces / MCP servers --"
+
+  echo "-- Marketplaces / plugins / MCP servers --"
   claude plugin marketplace list || true
+  claude plugin list || true
   claude mcp list || true
   echo
+
   echo "-- Round-trip smoke test --"
   claude -p "Reply with exactly: SETUP OK"
   exit 0

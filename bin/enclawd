@@ -162,7 +162,29 @@ creds_ok() {
   aws sts get-caller-identity --profile "$AWS_PROFILE_NAME" --region "$AWS_REGION_NAME" >/dev/null 2>&1
 }
 
+# Remote/headless sessions (SSH, or Linux with no display) must use the
+# device-code flow. The default authorization-code flow runs a localhost
+# callback server on THIS machine and redirects the browser to 127.0.0.1 —
+# but over SSH the browser completing the flow is on the employee's laptop,
+# so the redirect lands on the wrong host and the CLI waits forever. The
+# device-code grant has no callback: the CLI polls AWS while you finish
+# sign-in in any browser anywhere. ENCLAWD_DEVICE_CODE=1/0 forces it on/off.
+is_remote() {
+  case "${ENCLAWD_DEVICE_CODE:-}" in 1) return 0 ;; 0) return 1 ;; esac
+  [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}${SSH_CLIENT:-}" ] && return 0
+  [ "$(uname)" = "Linux" ] && [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && return 0
+  return 1
+}
+if is_remote; then REMOTE_LOGIN=1; else REMOTE_LOGIN=0; fi
+
 sso_login() {
+  if [ "$REMOTE_LOGIN" = "1" ]; then
+    echo "enclawd: remote session detected — using device-code sign-in. Open the URL below"
+    echo "enclawd: in any browser (e.g. on your laptop) and sign in with your Engram Google account."
+    aws sso login --sso-session "$SSO_SESSION" --use-device-code || true
+    creds_ok
+    return
+  fi
   # Opens the IAM Identity Center access portal in the browser. The portal is
   # federated to Google Workspace, so this lands on the normal Google sign-in.
   #
@@ -182,17 +204,21 @@ sso_login() {
   creds_ok
 }
 
+LOGIN_HINT="aws sso login --sso-session $SSO_SESSION"
+[ "$REMOTE_LOGIN" = "1" ] && LOGIN_HINT="$LOGIN_HINT --use-device-code"
+
 if [ "$MODE" != "doctor" ] && [ "${ENCLAWD_SKIP_AWS_CHECK:-0}" != "1" ]; then
   if ! creds_ok; then
     if [ -t 1 ]; then
-      echo "enclawd: AWS session for '$AWS_PROFILE_NAME' is missing or expired — opening browser sign-in (use your Engram Google account)..."
+      [ "$REMOTE_LOGIN" = "1" ] \
+        || echo "enclawd: AWS session for '$AWS_PROFILE_NAME' is missing or expired — opening browser sign-in (use your Engram Google account)..."
       sso_login \
-        || die "sign-in didn't complete. Run:  aws sso login --sso-session $SSO_SESSION   then re-run enclawd."
+        || die "sign-in didn't complete. Run:  $LOGIN_HINT   then re-run enclawd."
     else
       # Non-interactive (scripts, CI, `enclawd -p` from another tool): a browser
       # flow would hang, so fail with the fix instead.
       echo "enclawd: AWS session for '$AWS_PROFILE_NAME' is missing or expired." >&2
-      die "run:  aws sso login --sso-session $SSO_SESSION   then re-run enclawd."
+      die "run:  $LOGIN_HINT   then re-run enclawd."
     fi
   fi
 fi
@@ -203,10 +229,10 @@ fi
 # Claude Code wrote are preserved. With ENCLAWD_MARKETPLACE_DIR set, the GitHub
 # marketplace entry is dropped and the local clone is registered instead below.
 mkdir -p "$CONFIG_DIR"
-python3 - "$TEMPLATE" "$SETTINGS" "$SSO_SESSION" <<'PY'
+python3 - "$TEMPLATE" "$SETTINGS" "$SSO_SESSION" "$REMOTE_LOGIN" <<'PY'
 import copy, json, os, sys
 
-template_path, settings_path, session = sys.argv[1], sys.argv[2], sys.argv[3]
+template_path, settings_path, session, remote = sys.argv[1:5]
 tpl = json.load(open(template_path))
 if os.environ.get("ENCLAWD_MARKETPLACE_DIR"):
     tpl.pop("extraKnownMarketplaces", None)
@@ -214,8 +240,15 @@ if os.environ.get("ENCLAWD_MARKETPLACE_DIR"):
 # Re-auth in place when the SSO token expires mid-session instead of dying
 # halfway through a task. Claude Code runs this only on credential expiry.
 # Set here (not in the template) so the session name can't drift from
-# enclawd.config.json.
-tpl["awsAuthRefresh"] = "aws sso login --sso-session %s" % session
+# enclawd.config.json. On remote/SSH machines the browser callback flow can't
+# work and a device-code prompt inside Claude Code's refresh would hang unseen,
+# so there we drop the key entirely (delete-after-merge, in case this machine
+# wrote it on an earlier local run): expiry then fails visibly and re-running
+# enclawd signs in again.
+if remote == "1":
+    tpl.pop("awsAuthRefresh", None)
+else:
+    tpl["awsAuthRefresh"] = "aws sso login --sso-session %s" % session
 
 cur = {}
 if os.path.exists(settings_path):
@@ -236,6 +269,8 @@ def merge(dst, src):
 # would mutate `cur` too and the changed-check below would never fire.
 merged = copy.deepcopy(cur)
 merge(merged, tpl)
+if remote == "1":
+    merged.pop("awsAuthRefresh", None)
 if merged != cur:
     with open(settings_path, "w") as f:
         json.dump(merged, f, indent=2)
@@ -315,11 +350,11 @@ print("OK - CLAUDE_CODE_USE_BEDROCK=1")
 
   echo "-- AWS identity --"
   if ! creds_ok; then
-    echo "no live session; opening browser sign-in (use your Engram Google account)..."
+    [ "$REMOTE_LOGIN" = "1" ] || echo "no live session; opening browser sign-in (use your Engram Google account)..."
     sso_login || true
   fi
   aws sts get-caller-identity --profile "$AWS_PROFILE_NAME" --region "$AWS_REGION_NAME" || {
-    echo "FAILED — run: aws sso login --sso-session $SSO_SESSION"; exit 1; }
+    echo "FAILED — run: $LOGIN_HINT"; exit 1; }
   echo
 
   echo "-- Claude inference profiles enabled in Bedrock --"

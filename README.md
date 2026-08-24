@@ -21,8 +21,19 @@ Then:
 ## One-time steps setup can't do for you
 
 1. AWS sign-in: when credentials are missing or expired, `enclawd` runs
-   `aws login --profile engram-robotics` for you — you just approve in the
-   browser. (Non-interactive runs fail with that command instead of hanging.)
+   `aws sso login` for you — sign in with your Engram Google account.
+   - **Locally**, your browser opens automatically.
+   - **Over SSH / headless**, enclawd detects it and switches to the
+     device-code flow: it prints a URL and code — open the URL in any browser
+     (your laptop) and finish sign-in there. The default browser flow can't
+     work remotely because its `127.0.0.1` callback lands on your laptop
+     instead of the SSH host. Force either mode with `ENCLAWD_DEVICE_CODE=1`
+     or `=0` if the detection guesses wrong.
+   - Non-interactive runs fail with the exact command to run instead of
+     hanging.
+   - Mid-session expiry: locally Claude Code re-signs-in by itself
+     (`awsAuthRefresh`); on remote machines that flow can't run, so the
+     session shows an auth error — exit and re-run `enclawd`.
 2. Inside `enclawd`, run `/mcp` and authenticate **linear, notion, figma**. OAuth is per-person and browser-based — once per server.
 3. The first time you use Claude in a given repo it asks for folder trust. Once
    per folder.
